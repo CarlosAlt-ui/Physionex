@@ -14,8 +14,10 @@ class ApiError extends Error {
   constructor(status, detail) { super(detail); this.status = status; }
 }
 
-async function callGemini(input, images) {
-  const model = process.env.MODEL || 'gemini-flash-latest';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Una sola llamada a un modelo de Gemini.
+async function geminiOnce(model, input, images) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
@@ -27,11 +29,32 @@ async function callGemini(input, images) {
   });
   const j = await r.json().catch(() => ({}));
   if (r.status === 429) throw new ApiError(429, 'Se alcanzó el límite del plan gratuito. Espera un minuto e inténtalo de nuevo.');
+  if (r.status === 503 || r.status === 500) throw new ApiError(503, 'Gemini está saturado en este momento. Inténtalo de nuevo en unos minutos.');
   if (!r.ok) throw new ApiError(502, (j.error && j.error.message) || 'Error de Gemini');
   const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
   const text = parts.map((p) => p.text || '').join('');
   if (!text) throw new ApiError(502, 'Gemini no devolvió texto (¿contenido bloqueado?).');
   return text;
+}
+
+// Si el modelo está saturado (503) reintenta una vez; si sigue igual o se acaba su cuota (429),
+// pasa al siguiente modelo de la lista (uno más ligero, que suele estar menos ocupado).
+async function callGemini(input, images) {
+  const models = [process.env.MODEL || 'gemini-flash-latest', 'gemini-flash-lite-latest'];
+  let last;
+  for (const model of models) {
+    for (let intento = 0; intento < 2; intento++) {
+      try {
+        return await geminiOnce(model, input, images);
+      } catch (e) {
+        last = e;
+        if (e.status === 429) break;
+        if (e.status !== 503) throw e;
+        await sleep(1500);
+      }
+    }
+  }
+  throw last;
 }
 
 async function callClaude(input, images) {
