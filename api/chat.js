@@ -1,0 +1,67 @@
+// Función de servidor (Vercel). Recibe { input, images } desde la página, llama a la IA con la
+// API key guardada como variable de entorno y devuelve { text }. La key NUNCA llega al navegador.
+//
+// Variables de entorno:
+//   GEMINI_API_KEY     → usa Google Gemini (capa gratuita)        [recomendado]
+//   ANTHROPIC_API_KEY  → usa Claude (de pago); solo se usa si no hay GEMINI_API_KEY
+//   ACCESS_CODE        → (opcional) clave que la página pide a quien la usa
+//   MODEL              → (opcional) nombre del modelo, para cambiarlo sin tocar el código
+const SYSTEM =
+  'Eres el motor de PHYSIONEX, un tutor de física universitaria. Atiende únicamente solicitudes de física ' +
+  '(incluye generar preguntas o exámenes de física). Si la solicitud no es de física, responde exactamente: FUERA_DE_TEMA.';
+
+class ApiError extends Error {
+  constructor(status, detail) { super(detail); this.status = status; }
+}
+
+async function callGemini(input, images) {
+  const model = process.env.MODEL || 'gemini-flash-latest';
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM }] },
+      contents: [{ role: 'user', parts: [...images.map((d) => ({ inlineData: { mimeType: 'image/jpeg', data: String(d) } })), { text: input }] }],
+      generationConfig: { maxOutputTokens: 8000 },
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 429) throw new ApiError(429, 'Se alcanzó el límite del plan gratuito. Espera un minuto e inténtalo de nuevo.');
+  if (!r.ok) throw new ApiError(502, (j.error && j.error.message) || 'Error de Gemini');
+  const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+  const text = parts.map((p) => p.text || '').join('');
+  if (!text) throw new ApiError(502, 'Gemini no devolvió texto (¿contenido bloqueado?).');
+  return text;
+}
+
+async function callClaude(input, images) {
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: process.env.MODEL || 'claude-sonnet-5-5', max_tokens: 4000, system: SYSTEM,
+      messages: [{ role: 'user', content: [...images.map((d) => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: String(d) } })), { type: 'text', text: input }] }],
+    }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new ApiError(502, (j.error && j.error.message) || 'Error de Claude');
+  return j.content.map((c) => c.text || '').join('');
+}
+
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method_not_allowed' });
+  const code = process.env.ACCESS_CODE;
+  if (code && req.headers['x-access-code'] !== code) return res.status(401).json({ error: 'access_code' });
+
+  const { input, images = [] } = req.body || {};
+  if (typeof input !== 'string' || !input || input.length > 60000 || !Array.isArray(images) || images.length > 4)
+    return res.status(400).json({ error: 'bad_request' });
+
+  try {
+    if (process.env.GEMINI_API_KEY) return res.status(200).json({ text: await callGemini(input, images) });
+    if (process.env.ANTHROPIC_API_KEY) return res.status(200).json({ text: await callClaude(input, images) });
+    return res.status(500).json({ error: 'server', detail: 'Falta GEMINI_API_KEY en las variables de entorno.' });
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: 'upstream', detail: e.message });
+  }
+};
