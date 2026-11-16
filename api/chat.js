@@ -16,20 +16,29 @@ class ApiError extends Error {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Una sola llamada a un modelo de Gemini.
-async function geminiOnce(model, input, images) {
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM }] },
-      contents: [{ role: 'user', parts: [...images.map((d) => ({ inlineData: { mimeType: 'image/jpeg', data: String(d) } })), { text: input }] }],
-      generationConfig: { maxOutputTokens: 8000 },
-    }),
-  });
+// Una sola llamada a un modelo de Gemini (máximo 35 s; si tarda más, se corta y se prueba otra cosa).
+async function geminiOnce(model, input, images, thinking) {
+  const generationConfig = { maxOutputTokens: 6000 };
+  if (thinking) generationConfig.thinkingConfig = { thinkingBudget: 1024 }; // limita cuánto "piensa" antes de escribir
+  let r;
+  try {
+    r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+      signal: AbortSignal.timeout(35000),
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM }] },
+        contents: [{ role: 'user', parts: [...images.map((d) => ({ inlineData: { mimeType: 'image/jpeg', data: String(d) } })), { text: input }] }],
+        generationConfig,
+      }),
+    });
+  } catch (e) {
+    throw new ApiError(504, 'Gemini tardó demasiado en responder. Inténtalo de nuevo.');
+  }
   const j = await r.json().catch(() => ({}));
   if (r.status === 429) throw new ApiError(429, 'Se alcanzó el límite del plan gratuito. Espera un minuto e inténtalo de nuevo.');
   if (r.status === 503 || r.status === 500) throw new ApiError(503, 'Gemini está saturado en este momento. Inténtalo de nuevo en unos minutos.');
+  if (r.status === 400 && thinking) throw new ApiError(400, 'sin_thinking'); // el modelo no acepta el ajuste: se reintenta sin él
   if (!r.ok) throw new ApiError(502, (j.error && j.error.message) || 'Error de Gemini');
   const parts = (j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
   const text = parts.map((p) => p.text || '').join('');
@@ -37,18 +46,22 @@ async function geminiOnce(model, input, images) {
   return text;
 }
 
-// Si el modelo está saturado (503) reintenta una vez; si sigue igual o se acaba su cuota (429),
-// pasa al siguiente modelo de la lista (uno más ligero, que suele estar menos ocupado).
+// Prueba el modelo principal y, si está saturado, tarda demasiado o se acabó su cuota,
+// pasa a uno más ligero (que suele estar menos ocupado). Nunca pasa de ~80 s en total.
 async function callGemini(input, images) {
   const models = [process.env.MODEL || 'gemini-flash-latest', 'gemini-flash-lite-latest'];
+  const t0 = Date.now();
   let last;
   for (const model of models) {
+    let thinking = true;
     for (let intento = 0; intento < 2; intento++) {
+      if (Date.now() - t0 > 80000) throw last || new ApiError(504, 'Gemini tardó demasiado en responder.');
       try {
-        return await geminiOnce(model, input, images);
+        return await geminiOnce(model, input, images, thinking);
       } catch (e) {
         last = e;
-        if (e.status === 429) break;
+        if (e.status === 400 && e.message === 'sin_thinking') { thinking = false; intento--; continue; }
+        if (e.status === 429 || e.status === 504) break; // cuota agotada o muy lento: siguiente modelo
         if (e.status !== 503) throw e;
         await sleep(1500);
       }
